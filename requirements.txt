@@ -22,3 +22,5 @@ streamlit
 tqdm
 pytest-cov
 rioxarray
+mgrs==1.4.6
+earthaccess==0.8.2
