@@ -72,6 +72,54 @@ class Norm2D(nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous()
         return x
 
+# class CoAtNetSeg(nn.Module):
+#     def __init__(
+#         self,
+#         image_size: int = 224,
+#         num_classes: int = 2,
+#         freeze_backbone: bool = True,
+#     ) -> None:
+#         super().__init__()
+        
+#         self.backbone = CoAtNet(
+#             image_size=(image_size, image_size),
+#             in_channels=3,
+#             num_blocks=[2, 2, 3, 5, 2],  # coatnet_0 configuration
+#             channels=[64, 96, 192, 384, 768],
+#             num_classes=num_classes,
+#             block_types=['C', 'C', 'T', 'T']
+#         )
+#         # Remove classification head
+#         self.backbone.pool = nn.Identity()
+#         self.backbone.fc = nn.Identity()
+
+#         if freeze_backbone:
+#             for param in self.backbone.parameters():
+#                 param.requires_grad = False
+
+#         def upscaling_block(in_channels: int, out_channels: int) -> nn.Module:
+#             return nn.Sequential(
+#                 nn.ConvTranspose2d(
+#                     in_channels, out_channels, kernel_size=3,
+#                     stride=2, padding=1, output_padding=1
+#                 ),
+#                 nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+#                 nn.BatchNorm2d(out_channels),
+#                 nn.ReLU(),
+#             )
+
+#         embed_dims = [768 // (2**i) for i in range(6)]  # [768, 384, 192, 96, 48, 24]
+#         self.segmentation_head = nn.Sequential(
+#             *[upscaling_block(embed_dims[i], embed_dims[i+1]) for i in range(5)],
+#             nn.Conv2d(embed_dims[-1], num_classes, kernel_size=1)
+#         )
+
+#     def forward(self, img: torch.Tensor) -> torch.Tensor:
+#         # Remove temporal dimension if present (B, C, T, H, W) -> (B, C, H, W)
+#         img = img.squeeze(2) if img.ndim == 5 else img
+#         features = self.backbone(img)
+#         return self.segmentation_head(features)
+
 class CoAtNetSeg(nn.Module):
     def __init__(
         self,
@@ -115,7 +163,14 @@ class CoAtNetSeg(nn.Module):
         )
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        # Remove temporal dimension if present (B, C, T, H, W) -> (B, C, H, W)
-        img = img.squeeze(2) if img.ndim == 5 else img
+        # Handle temporal dimension: average over time steps
+        if img.ndim == 5:  # Input shape: [batch_size, temporal_steps, channels, height, width]
+            img = img.mean(dim=1)  # Average over temporal dimension
+        elif img.ndim == 4:  # Input shape: [batch_size, channels, height, width]
+            pass  # No temporal dimension, proceed as is
+        else:
+            raise ValueError(f"Unexpected input shape: {img.shape}")
+
+        # Pass through backbone and segmentation head
         features = self.backbone(img)
         return self.segmentation_head(features)
