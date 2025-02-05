@@ -170,8 +170,8 @@ class CoAtNetSeg(nn.Module):
             pass  # No temporal dimension, proceed as is
         elif img.ndim == 3:  # Input shape: [batch_size, channels, height, width]
             pass 
-        elif img.ndim == 3:  # Input shape: [batch_size, channels, height, width]
-            img = img.unsqueeze() 
+        elif img.ndim == 2:  # Input shape: [batch_size, channels, height, width]
+            img = img.unsqueeze(0) 
         else:
             raise ValueError(f"Unexpected input shape: {img.shape}")
 
