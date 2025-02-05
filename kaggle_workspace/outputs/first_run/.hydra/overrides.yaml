@@ -1,0 +1,6 @@
+- root_dir=geo-ai-hack
+- train.batch_size=8
+- train.num_epochs=1
+- mode=train
+- train_filepath=train_split.csv
+- valid_filepath=validation_split.csv
