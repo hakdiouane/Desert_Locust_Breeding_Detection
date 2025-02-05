@@ -17,359 +17,126 @@
 # For more details, see https://creativecommons.org/licenses/by-nc-sa/4.0/
 # ------------------------------------------------------------------------------
 
-"""Run Module Containing Training, Evaluation and Inference Logic."""
+"""Model Module."""
 
-import json
-import logging
 import os
-from functools import partial
-from typing import Any, List, Optional, Tuple
+import time
+from pathlib import Path
 
-import hydra
 import numpy as np
-import pytorch_lightning as pl
-import rasterio
+import requests  # type: ignore
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.loggers import TensorBoardLogger
-from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
+import yaml  # type: ignore
+from absl import logging
 
-from instageo.model.dataloader import (
-    InstaGeoDataset,
-    process_and_augment,
-    process_data,
-    process_test,
-)
-from instageo.model.infer_utils import chip_inference, sliding_window_inference
-# --------------------------------------------------------------------------
-# CHANGED: Import our new CoAtNet-based segmentation model (instead of PrithviSeg)
-# from instageo.model.model import PrithviSeg  # <- remove or comment out
-from instageo.model.model import CoAtNetSeg  # <- use this instead
-# --------------------------------------------------------------------------
+from instageo.model.CoAtNet import CoAtNet  # Import CoAtNet instead of ViTEncoder
 
 
-pl.seed_everything(seed=1042, workers=True)
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
+def download_file(url: str, filename: str | Path, retries: int = 3) -> None:
+    """Downloads a file from the given URL and saves it to a local file."""
+    if os.path.exists(filename):
+        logging.info(f"File '{filename}' already exists. Skipping download.")
+        return
 
-log = logging.getLogger(__name__)
-log.setLevel(logging.INFO)
+    for attempt in range(retries):
+        try:
+            response = requests.get(url)
+            if response.status_code == 200:
+                with open(filename, "wb") as f:
+                    f.write(response.content)
+                logging.info(f"Download successful on attempt {attempt + 1}")
+                break
+            else:
+                logging.warning(
+                    f"Attempt {attempt + 1} failed with status code {response.status_code}"
+                )
+        except requests.RequestException as e:
+            logging.warning(f"Attempt {attempt + 1} failed with error: {e}")
 
+        if attempt < retries - 1:
+            time.sleep(2)
 
-def check_required_flags(required_flags: List[str], config: DictConfig) -> None:
-    ...
-    # same as before
-
-
-def get_device() -> str:
-    ...
-    # same as before
-
-
-def eval_collate_fn(batch: tuple[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    ...
-    # same as before
-
-
-def infer_collate_fn(batch: tuple[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-    ...
-    # same as before
-
-
-def create_dataloader(
-    dataset: Dataset,
-    batch_size: int,
-    shuffle: bool = False,
-    num_workers: int = 1,
-    collate_fn: Optional = None,
-    pin_memory: bool = True,
-) -> DataLoader:
-    ...
-    # same as before
+    else:
+        raise Exception("Failed to download the file after several attempts.")
 
 
-class CoAtNetSegmentationModule(pl.LightningModule):
-    """
-    PyTorch Lightning wrapper around the CoAtNetSeg model
-    (similar to the old PrithviSegmentationModule but referencing CoAtNetSeg).
-    """
-
-    def __init__(
-        self,
-        image_size: int = 224,
-        learning_rate: float = 1e-4,
-        freeze_backbone: bool = True,
-        num_classes: int = 2,
-        temporal_step: int = 1,
-        class_weights: List[float] = None,
-        ignore_index: int = -100,
-        weight_decay: float = 1e-2,
-        coatnet_variant: str = "coatnet_0",
-        in_chans: int = 3,
-    ):
-        """
-        Args:
-            image_size (int): Size of input image (HxW).
-            num_classes (int): Number of segmentation classes.
-            freeze_backbone (bool): Freeze CoAtNet backbone weights if True.
-            temporal_step (int): You can pass this if you do multi-temporal;
-                                 might be used to set in_chans, etc.
-            coatnet_variant (str): Which coatnet variant to load.
-            in_chans (int): Number of input channels (including multi-temporal).
-            ...
-        """
+class Norm2D(nn.Module):
+    """A normalization layer for 2D inputs."""
+    def __init__(self, embed_dim: int):
         super().__init__()
-        # If you have multi-temporal data, you might set in_chans = (temporal_step * #bands).
-        # Or the caller can do that. For example:
-        #   in_chans = len(cfg.dataloader.bands) * temporal_step
-        # We'll assume the user does that logic outside.
-
-        self.save_hyperparameters()
-
-        self.net = CoAtNetSeg(
-            image_size=image_size,
-            num_classes=num_classes,
-            freeze_backbone=freeze_backbone,
-            in_chans=in_chans,
-            coatnet_variant=coatnet_variant,
-        )
-
-        weight_tensor = torch.tensor(class_weights).float() if class_weights else None
-        self.criterion = nn.CrossEntropyLoss(
-            ignore_index=ignore_index, weight=weight_tensor
-        )
-        self.learning_rate = learning_rate
-        self.ignore_index = ignore_index
-        self.weight_decay = weight_decay
+        self.ln = nn.LayerNorm(embed_dim, eps=1e-6)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the model."""
-        return self.net(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.ln(x)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return x
 
-    def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
-        inputs, labels = batch
-        outputs = self.forward(inputs)
-        loss = self.criterion(outputs, labels.long())
-        self.log_metrics(outputs, labels, "train", loss)
-        return loss
 
-    def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
-        inputs, labels = batch
-        outputs = self.forward(inputs)
-        loss = self.criterion(outputs, labels.long())
-        self.log_metrics(outputs, labels, "val", loss)
-        return loss
-
-    def test_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
-        inputs, labels = batch
-        outputs = self.forward(inputs)
-        loss = self.criterion(outputs, labels.long())
-        self.log_metrics(outputs, labels, "test", loss)
-        return loss
-
-    def predict_step(self, batch: Any) -> torch.Tensor:
-        prediction = self.forward(batch)
-        probabilities = torch.nn.functional.softmax(prediction, dim=1)[:, 1, :, :]
-        return probabilities
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
-        )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=10, T_mult=2, eta_min=0
-        )
-        return [optimizer], [scheduler]
-
-    def log_metrics(
+class CoAtNetSeg(nn.Module):
+    """CoAtNet Segmentation Model."""
+    def __init__(
         self,
-        predictions: torch.Tensor,
-        labels: torch.Tensor,
-        stage: str,
-        loss: torch.Tensor,
+        temporal_step: int = 1,
+        image_size: int = 224,
+        num_classes: int = 2,
+        freeze_backbone: bool = True,
     ) -> None:
-        out = self.compute_metrics(predictions, labels)
-        self.log(f"{stage}_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log(f"{stage}_aAcc", out["acc"], on_step=True, on_epoch=True, prog_bar=True)
-        self.log(f"{stage}_mIoU", out["iou"], on_step=True, on_epoch=True, prog_bar=True)
+        super().__init__()
+        in_channels = 3  # Assuming 3 input channels per timestep
+        self.temporal_step = temporal_step
+        self.image_size = image_size
+        self.num_classes = num_classes
 
-        for idx, value in enumerate(out["iou_per_class"]):
-            self.log(f"{stage}_IoU_{idx}", value, on_step=True, on_epoch=True)
-        for idx, value in enumerate(out["acc_per_class"]):
-            self.log(f"{stage}_Acc_{idx}", value, on_step=True, on_epoch=True)
-        for idx, value in enumerate(out["precision_per_class"]):
-            self.log(f"{stage}_Precision_{idx}", value, on_step=True, on_epoch=True)
-        for idx, value in enumerate(out["recall_per_class"]):
-            self.log(f"{stage}_Recall_{idx}", value, on_step=True, on_epoch=True)
+        # Initialize CoAtNet backbone
+        self.coatnet_backbone = CoAtNet(
+            image_size=(image_size, image_size),
+            in_channels=in_channels * temporal_step,
+            num_blocks=[2, 2, 3, 5, 2],  # From coatnet_0 configuration
+            channels=[64, 96, 192, 384, 768],
+            num_classes=0,  # Disable classification head
+            block_types=['C', 'C', 'T', 'T']
+        )
+        # Remove unused layers from CoAtNet
+        del self.coatnet_backbone.pool
+        del self.coatnet_backbone.fc
 
-    def compute_metrics(
-        self, pred_mask: torch.Tensor, gt_mask: torch.Tensor
-    ) -> dict:
-        pred_mask = torch.argmax(pred_mask, dim=1)
-        no_ignore = gt_mask.ne(self.ignore_index).to(self.device)
-        pred_mask = pred_mask.masked_select(no_ignore).cpu().numpy()
-        gt_mask = gt_mask.masked_select(no_ignore).cpu().numpy()
-        classes = np.unique(np.concatenate((gt_mask, pred_mask)))
+        if freeze_backbone:
+            for param in self.coatnet_backbone.parameters():
+                param.requires_grad = False
 
-        iou_per_class = []
-        accuracy_per_class = []
-        precision_per_class = []
-        recall_per_class = []
+        # Segmentation head
+        initial_channels = 768  # Output channels from CoAtNet's last stage
+        embed_dims = [initial_channels // (2 ** i) for i in range(6)]  # [768, 384, 192, 96, 48, 24]
 
-        for clas in classes:
-            pred_cls = pred_mask == clas
-            gt_cls = gt_mask == clas
-
-            intersection = np.logical_and(pred_cls, gt_cls)
-            union = np.logical_or(pred_cls, gt_cls)
-            true_positive = np.sum(intersection)
-            false_positive = np.sum(pred_cls) - true_positive
-            false_negative = np.sum(gt_cls) - true_positive
-
-            if np.any(union):
-                iou = np.sum(intersection) / np.sum(union)
-                iou_per_class.append(iou)
-
-            accuracy = true_positive / np.sum(gt_cls) if np.sum(gt_cls) > 0 else 0
-            accuracy_per_class.append(accuracy)
-
-            precision = (
-                true_positive / (true_positive + false_positive)
-                if (true_positive + false_positive) > 0
-                else 0
+        def upscaling_block(in_channels: int, out_channels: int) -> nn.Module:
+            return nn.Sequential(
+                nn.ConvTranspose2d(
+                    in_channels, out_channels, kernel_size=3, 
+                    stride=2, padding=1, output_padding=1
+                ),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(),
             )
-            precision_per_class.append(precision)
 
-            recall = (
-                true_positive / (true_positive + false_negative)
-                if (true_positive + false_negative) > 0
-                else 0
-            )
-            recall_per_class.append(recall)
-
-        mean_iou = np.mean(iou_per_class) if iou_per_class else 0.0
-        overall_accuracy = np.sum(pred_mask == gt_mask) / gt_mask.size
-
-        return {
-            "iou": mean_iou,
-            "acc": overall_accuracy,
-            "acc_per_class": accuracy_per_class,
-            "iou_per_class": iou_per_class,
-            "precision_per_class": precision_per_class,
-            "recall_per_class": recall_per_class,
-        }
-
-
-def compute_mean_std(data_loader: DataLoader) -> Tuple[List[float], List[float]]:
-    ...
-    # same as before
-
-
-@hydra.main(config_path="configs", version_base=None, config_name="config")
-def main(cfg: DictConfig) -> None:
-    """Runner Entry Point."""
-    log.info(f"Script: {__file__}")
-    log.info(f"Imported hydra config:\n{OmegaConf.to_yaml(cfg)}")
-
-    BANDS = cfg.dataloader.bands
-    MEAN = cfg.dataloader.mean
-    STD = cfg.dataloader.std
-    IM_SIZE = cfg.dataloader.img_size
-    TEMPORAL_SIZE = cfg.dataloader.temporal_dim
-
-    batch_size = cfg.train.batch_size
-    root_dir = cfg.root_dir
-    valid_filepath = cfg.valid_filepath
-    train_filepath = cfg.train_filepath
-    test_filepath = cfg.test_filepath
-    checkpoint_path = cfg.checkpoint_path
-
-    if cfg.mode == "stats":
-        ...
-        # same as before
-
-    if cfg.mode == "train":
-        ...
-        # Create train_dataset, valid_dataset as before
-        train_loader = create_dataloader(train_dataset, ...)
-        valid_loader = create_dataloader(valid_dataset, ...)
-
-        # ---------------------------------------------------------------------
-        # CHANGED: Use CoAtNetSegmentationModule instead of Prithvi
-        model = CoAtNetSegmentationModule(
-            image_size=IM_SIZE,
-            learning_rate=cfg.train.learning_rate,
-            freeze_backbone=cfg.model.freeze_backbone,
-            num_classes=cfg.model.num_classes,
-            temporal_step=cfg.dataloader.temporal_dim,
-            class_weights=cfg.train.class_weights,
-            ignore_index=cfg.train.ignore_index,
-            weight_decay=cfg.train.weight_decay,
-            coatnet_variant=cfg.model.coatnet_variant,
-            in_chans=len(BANDS) * cfg.dataloader.temporal_dim,
+        self.segmentation_head = nn.Sequential(
+            *[upscaling_block(embed_dims[i], embed_dims[i+1]) for i in range(5)],
+            nn.Conv2d(embed_dims[-1], num_classes, kernel_size=1)
         )
-        # ---------------------------------------------------------------------
 
-        hydra_out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
-        checkpoint_callback = ModelCheckpoint(
-            monitor="val_mIoU",
-            dirpath=hydra_out_dir,
-            filename="instageo_epoch-{epoch:02d}-val_iou-{val_mIoU:.2f}",
-            auto_insert_metric_name=False,
-            mode="max",
-            save_top_k=3,
-        )
-        logger = TensorBoardLogger(hydra_out_dir, name="instageo")
-
-        trainer = pl.Trainer(
-            accelerator=get_device(),
-            max_epochs=cfg.train.num_epochs,
-            callbacks=[checkpoint_callback],
-            logger=logger,
-        )
-        trainer.fit(model, train_loader, valid_loader)
-
-    elif cfg.mode == "eval":
-        ...
-        # CHANGED: Load CoAtNetSegmentationModule
-        model = CoAtNetSegmentationModule.load_from_checkpoint(
-            checkpoint_path,
-            image_size=IM_SIZE,
-            learning_rate=cfg.train.learning_rate,
-            freeze_backbone=cfg.model.freeze_backbone,
-            num_classes=cfg.model.num_classes,
-            temporal_step=cfg.dataloader.temporal_dim,
-            class_weights=cfg.train.class_weights,
-            ignore_index=cfg.train.ignore_index,
-            weight_decay=cfg.train.weight_decay,
-            coatnet_variant=cfg.model.coatnet_variant,
-            in_chans=len(BANDS) * cfg.dataloader.temporal_dim,
-        )
-        trainer = pl.Trainer(accelerator=get_device())
-        result = trainer.test(model, dataloaders=test_loader)
-        log.info(f"Evaluation results:\n{result}")
-
-    elif cfg.mode in ["sliding_inference", "chip_inference"]:
-        # same logic, just change the class that is loaded
-        ...
-        model = CoAtNetSegmentationModule.load_from_checkpoint(
-            checkpoint_path,
-            image_size=IM_SIZE,
-            learning_rate=cfg.train.learning_rate,
-            freeze_backbone=cfg.model.freeze_backbone,
-            num_classes=cfg.model.num_classes,
-            temporal_step=cfg.dataloader.temporal_dim,
-            class_weights=cfg.train.class_weights,
-            ignore_index=cfg.train.ignore_index,
-            weight_decay=cfg.train.weight_decay,
-            coatnet_variant=cfg.model.coatnet_variant,
-            in_chans=len(BANDS) * cfg.dataloader.temporal_dim,
-        )
-        # Then do the inference logic as before...
-        ...
-
-if __name__ == "__main__":
-    main()
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        B, C, T, H, W = img.shape
+        # Combine temporal and channel dimensions
+        x = img.view(B, C * T, H, W)
+        
+        # Forward through CoAtNet stages
+        x = self.coatnet_backbone.s0(x)
+        x = self.coatnet_backbone.s1(x)
+        x = self.coatnet_backbone.s2(x)
+        x = self.coatnet_backbone.s3(x)
+        x = self.coatnet_backbone.s4(x)
+        
+        # Upsample to original resolution
+        return self.segmentation_head(x)
