@@ -115,36 +115,36 @@ class CoAtNetSeg(nn.Module):
             nn.Conv2d(embed_dims[-1], num_classes, kernel_size=1)
         )
 
-def forward(self, img: torch.Tensor) -> torch.Tensor:
-    # Handle temporal dimension: average over time steps
-    if img.ndim == 5:  # [batch_size, temporal_steps, channels, height, width]
-        img = img.mean(dim=1)  # Average over temporal dimension
-    elif img.ndim == 4:  # [batch_size, channels, height, width]
-        pass  # Input already batched
-    elif img.ndim == 3:  # [channels, height, width]
-        img = img.unsqueeze(0)  # Add batch dimension
-    elif img.ndim == 2:  # [height, width] -> assume grayscale; add channel and batch dims
-        img = img.unsqueeze(0).unsqueeze(0)
-    else:
-        raise ValueError(f"Unexpected input shape: {img.shape}")
+    def forward(self, img: torch.Tensor) -> torch.Tensor:
+        # Handle temporal dimension: average over time steps
+        if img.ndim == 5:  # [batch_size, temporal_steps, channels, height, width]
+            img = img.mean(dim=1)  # Average over temporal dimension
+        elif img.ndim == 4:  # [batch_size, channels, height, width]
+            pass  # Input already batched
+        elif img.ndim == 3:  # [channels, height, width]
+            img = img.unsqueeze(0)  # Add batch dimension
+        elif img.ndim == 2:  # [height, width] -> assume grayscale; add channel and batch dims
+            img = img.unsqueeze(0).unsqueeze(0)
+        else:
+            raise ValueError(f"Unexpected input shape: {img.shape}")
 
-    # Pass through backbone
-    features = self.backbone(img)
+        # Pass through backbone
+        features = self.backbone(img)
 
-    # Now, ensure that the features have the right shape for the segmentation head.
-    # If features is 2D, we assume it's a flattened spatial map with shape [num_tokens, channels].
-    if features.ndim == 2:
-        # At this point, features has shape [num_tokens, channels]
-        # We expect channels to be 768 (to match segmentation_head's expected input).
-        # For example, if num_tokens == 2048, we can reshape into a 2D grid of size 32 x 64.
-        features = features.transpose(0, 1)  # Now shape [channels, num_tokens]
-        features = features.view(1, features.shape[0], 32, 64)  # [batch, channels, H, W]
-    elif features.ndim == 3:
-        # features with shape [channels, H, W] -> add batch dimension.
-        features = features.unsqueeze(0)
-    elif features.ndim != 4:
-        raise ValueError(f"Unexpected features shape: {features.shape}")
+        # Now, ensure that the features have the right shape for the segmentation head.
+        # If features is 2D, we assume it's a flattened spatial map with shape [num_tokens, channels].
+        if features.ndim == 2:
+            # At this point, features has shape [num_tokens, channels]
+            # We expect channels to be 768 (to match segmentation_head's expected input).
+            # For example, if num_tokens == 2048, we can reshape into a 2D grid of size 32 x 64.
+            features = features.transpose(0, 1)  # Now shape [channels, num_tokens]
+            features = features.view(1, features.shape[0], 32, 64)  # [batch, channels, H, W]
+        elif features.ndim == 3:
+            # features with shape [channels, H, W] -> add batch dimension.
+            features = features.unsqueeze(0)
+        elif features.ndim != 4:
+            raise ValueError(f"Unexpected features shape: {features.shape}")
 
-    # Now features is a 4D tensor as required.
-    return self.segmentation_head(features)
+        # Now features is a 4D tensor as required.
+        return self.segmentation_head(features)
 
