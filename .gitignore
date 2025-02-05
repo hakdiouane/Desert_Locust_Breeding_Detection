@@ -1,2 +1,8 @@
 secret/*
 .netrc
+*.csv
+*.xlsx
+*.tif
+*.nc
+*.nc4
+*.gitignore
