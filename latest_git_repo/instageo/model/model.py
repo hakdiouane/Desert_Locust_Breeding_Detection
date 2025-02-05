@@ -116,6 +116,9 @@ class CoAtNetSeg(nn.Module):
         )
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
+
+        batch_size = img.shape[0]
+        
         # Handle temporal dimension: average over time steps
         if img.ndim == 5:  # [batch_size, temporal_steps, channels, height, width]
             img = img.mean(dim=1)  # Average over temporal dimension
@@ -138,7 +141,7 @@ class CoAtNetSeg(nn.Module):
             # We expect channels to be 768 (to match segmentation_head's expected input).
             # For example, if num_tokens == 2048, we can reshape into a 2D grid of size 32 x 64.
             features = features.transpose(0, 1)  # Now shape [channels, num_tokens]
-            features = features.view(1, features.shape[0], 32, 64)  # [batch, channels, H, W]
+            features = features.view(batch_size, features.shape[0], 32, 64)  # [batch, channels, H, W]
         elif features.ndim == 3:
             # features with shape [channels, H, W] -> add batch dimension.
             features = features.unsqueeze(0)
