@@ -80,7 +80,6 @@ class CoAtNetSeg(nn.Module):
         freeze_backbone: bool = True,
     ) -> None:
         super().__init__()
-        from CoAtNet import CoAtNet  # Ensure CoAtNet.py is imported correctly
         
         self.backbone = CoAtNet(
             image_size=(image_size, image_size),
