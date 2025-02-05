@@ -23,7 +23,7 @@ import json
 import logging
 import os
 from functools import partial
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import hydra
 import numpy as np
@@ -44,12 +44,7 @@ from instageo.model.dataloader import (
     process_test,
 )
 from instageo.model.infer_utils import chip_inference, sliding_window_inference
-# --------------------------------------------------------------------------
-# CHANGED: Import our new CoAtNet-based segmentation model (instead of PrithviSeg)
-# from instageo.model.model import PrithviSeg  # <- remove or comment out
-from instageo.model.model import CoAtNetSeg  # <- use this instead
-# --------------------------------------------------------------------------
-
+from instageo.model.model import CoAtNetSeg
 
 pl.seed_everything(seed=1042, workers=True)
 torch.backends.cudnn.deterministic = True
@@ -153,65 +148,54 @@ def create_dataloader(
         pin_memory=pin_memory,
     )
 
-class CoAtNetSegmentationModule(pl.LightningModule):
-    """
-    PyTorch Lightning wrapper around the CoAtNetSeg model
-    (similar to the old PrithviSegmentationModule but referencing CoAtNetSeg).
-    """
 
+class CoAtNetSegmentationModule(pl.LightningModule):
     def __init__(
         self,
         image_size: int = 224,
         learning_rate: float = 1e-4,
         freeze_backbone: bool = True,
         num_classes: int = 2,
-        temporal_step: int = 1,
-        class_weights: List[float] = None,
+        class_weights: List[float] = [1, 2],
         ignore_index: int = -100,
         weight_decay: float = 1e-2,
-        coatnet_variant: str = "coatnet_0",
-        in_chans: int = 3,
-    ):
-        """
-        Args:
-            image_size (int): Size of input image (HxW).
-            num_classes (int): Number of segmentation classes.
-            freeze_backbone (bool): Freeze CoAtNet backbone weights if True.
-            temporal_step (int): You can pass this if you do multi-temporal;
-                                 might be used to set in_chans, etc.
-            coatnet_variant (str): Which coatnet variant to load.
-            in_chans (int): Number of input channels (including multi-temporal).
-            ...
-        """
+    ) -> None:
         super().__init__()
-        # If you have multi-temporal data, you might set in_chans = (temporal_step * #bands).
-        # Or the caller can do that. For example:
-        #   in_chans = len(cfg.dataloader.bands) * temporal_step
-        # We'll assume the user does that logic outside.
-
-        self.save_hyperparameters()
-
         self.net = CoAtNetSeg(
             image_size=image_size,
             num_classes=num_classes,
             freeze_backbone=freeze_backbone,
-            in_chans=in_chans,
-            coatnet_variant=coatnet_variant,
         )
-
-        weight_tensor = torch.tensor(class_weights).float() if class_weights else None
         self.criterion = nn.CrossEntropyLoss(
-            ignore_index=ignore_index, weight=weight_tensor
+            ignore_index=ignore_index, 
+            weight=torch.tensor(class_weights).float() if class_weights else None
         )
         self.learning_rate = learning_rate
         self.ignore_index = ignore_index
         self.weight_decay = weight_decay
 
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the model."""
+        """Define the forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor for the model.
+
+        Returns:
+            torch.Tensor: Output tensor from the model.
+        """
         return self.net(x)
 
     def training_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        """Perform a training step.
+
+        Args:
+            batch (Any): Input batch data.
+            batch_idx (int): Index of the batch.
+
+        Returns:
+            torch.Tensor: The loss value for the batch.
+        """
         inputs, labels = batch
         outputs = self.forward(inputs)
         loss = self.criterion(outputs, labels.long())
@@ -219,6 +203,15 @@ class CoAtNetSegmentationModule(pl.LightningModule):
         return loss
 
     def validation_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        """Perform a validation step.
+
+        Args:
+            batch (Any): Input batch data.
+            batch_idx (int): Index of the batch.
+
+        Returns:
+            torch.Tensor: The loss value for the batch.
+        """
         inputs, labels = batch
         outputs = self.forward(inputs)
         loss = self.criterion(outputs, labels.long())
@@ -226,6 +219,15 @@ class CoAtNetSegmentationModule(pl.LightningModule):
         return loss
 
     def test_step(self, batch: Any, batch_idx: int) -> torch.Tensor:
+        """Perform a test step.
+
+        Args:
+            batch (Any): Input batch data.
+            batch_idx (int): Index of the batch.
+
+        Returns:
+            torch.Tensor: The loss value for the batch.
+        """
         inputs, labels = batch
         outputs = self.forward(inputs)
         loss = self.criterion(outputs, labels.long())
@@ -233,11 +235,29 @@ class CoAtNetSegmentationModule(pl.LightningModule):
         return loss
 
     def predict_step(self, batch: Any) -> torch.Tensor:
+        """Perform a prediction step.
+
+        Args:
+            batch (Any): Input batch data.
+
+        Returns:
+            torch.Tensor: The loss value for the batch.
+        """
         prediction = self.forward(batch)
         probabilities = torch.nn.functional.softmax(prediction, dim=1)[:, 1, :, :]
         return probabilities
 
-    def configure_optimizers(self):
+    def configure_optimizers(
+        self,
+    ) -> Tuple[
+        List[torch.optim.Optimizer], List[torch.optim.lr_scheduler._LRScheduler]
+    ]:
+        """Configure the model's optimizers and learning rate schedulers.
+
+        Returns:
+            Tuple[List[torch.optim.Optimizer], List[torch.optim.lr_scheduler]]:
+            A tuple containing the list of optimizers and the list of LR schedulers.
+        """
         optimizer = torch.optim.AdamW(
             self.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay
         )
@@ -253,23 +273,92 @@ class CoAtNetSegmentationModule(pl.LightningModule):
         stage: str,
         loss: torch.Tensor,
     ) -> None:
-        out = self.compute_metrics(predictions, labels)
-        self.log(f"{stage}_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
-        self.log(f"{stage}_aAcc", out["acc"], on_step=True, on_epoch=True, prog_bar=True)
-        self.log(f"{stage}_mIoU", out["iou"], on_step=True, on_epoch=True, prog_bar=True)
+        """Log all metrics for any stage.
 
+        Args:
+            predictions(torch.Tensor): Prediction tensor from the model.
+            labels(torch.Tensor): Label mask.
+            stage (str): One of train, val and test stages.
+            loss (torch.Tensor): Loss value.
+
+        Returns:
+            None.
+        """
+        out = self.compute_metrics(predictions, labels)
+        self.log(
+            f"{stage}_loss",
+            loss,
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+        self.log(
+            f"{stage}_aAcc",
+            out["acc"],
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
+        self.log(
+            f"{stage}_mIoU",
+            out["iou"],
+            on_step=True,
+            on_epoch=True,
+            prog_bar=True,
+            logger=True,
+        )
         for idx, value in enumerate(out["iou_per_class"]):
-            self.log(f"{stage}_IoU_{idx}", value, on_step=True, on_epoch=True)
+            self.log(
+                f"{stage}_IoU_{idx}",
+                value,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
         for idx, value in enumerate(out["acc_per_class"]):
-            self.log(f"{stage}_Acc_{idx}", value, on_step=True, on_epoch=True)
+            self.log(
+                f"{stage}_Acc_{idx}",
+                value,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
         for idx, value in enumerate(out["precision_per_class"]):
-            self.log(f"{stage}_Precision_{idx}", value, on_step=True, on_epoch=True)
+            self.log(
+                f"{stage}_Precision_{idx}",
+                value,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
         for idx, value in enumerate(out["recall_per_class"]):
-            self.log(f"{stage}_Recall_{idx}", value, on_step=True, on_epoch=True)
+            self.log(
+                f"{stage}_Recall_{idx}",
+                value,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
 
     def compute_metrics(
         self, pred_mask: torch.Tensor, gt_mask: torch.Tensor
-    ) -> dict:
+    ) -> dict[str, List[float]]:
+        """Calculate the Intersection over Union (IoU), Accuracy, Precision and Recall metrics.
+
+        Args:
+            pred_mask (np.array): Predicted segmentation mask.
+            gt_mask (np.array): Ground truth segmentation mask.
+
+        Returns:
+            dict: A dictionary containing 'iou', 'overall_accuracy', and
+                'accuracy_per_class', 'precision_per_class' and 'recall_per_class'.
+        """
         pred_mask = torch.argmax(pred_mask, dim=1)
         no_ignore = gt_mask.ne(self.ignore_index).to(self.device)
         pred_mask = pred_mask.masked_select(no_ignore).cpu().numpy()
@@ -312,6 +401,7 @@ class CoAtNetSegmentationModule(pl.LightningModule):
             )
             recall_per_class.append(recall)
 
+        # Overall IoU and accuracy
         mean_iou = np.mean(iou_per_class) if iou_per_class else 0.0
         overall_accuracy = np.sum(pred_mask == gt_mask) / gt_mask.size
 
@@ -326,13 +416,49 @@ class CoAtNetSegmentationModule(pl.LightningModule):
 
 
 def compute_mean_std(data_loader: DataLoader) -> Tuple[List[float], List[float]]:
-    ...
-    # same as before
+    """Compute the mean and standard deviation of a dataset.
+
+    Args:
+        data_loader (DataLoader): PyTorch DataLoader.
+
+    Returns:
+        mean (list): List of means for each channel.
+        std (list): List of standard deviations for each channel.
+    """
+    mean = 0.0
+    var = 0.0
+    nb_samples = 0
+
+    for data, _ in data_loader:
+        # Reshape data to (B, C, T*H*W)
+        batch_samples = data.size(0)
+        data = data.view(batch_samples, data.size(1), -1)
+
+        nb_samples += batch_samples
+
+        # Sum over batch, height and width
+        mean += data.mean(2).sum(0)
+
+        var += data.var(2, unbiased=False).sum(0)
+
+    mean /= nb_samples
+    var /= nb_samples
+    std = torch.sqrt(var)
+    return mean.tolist(), std.tolist()  # type:ignore
 
 
 @hydra.main(config_path="configs", version_base=None, config_name="config")
 def main(cfg: DictConfig) -> None:
-    """Runner Entry Point."""
+    """Runner Entry Point.
+
+    Performs training, evaluation or inference/prediction depending on the selected mode.
+
+    Arguments:
+        cfg (DictConfig): Dict-like object containing necessary values used to configure runner.
+
+    Returns:
+        None.
+    """
     log.info(f"Script: {__file__}")
     log.info(f"Imported hydra config:\n{OmegaConf.to_yaml(cfg)}")
 
@@ -418,23 +544,15 @@ def main(cfg: DictConfig) -> None:
         valid_loader = create_dataloader(
             valid_dataset, batch_size=batch_size, shuffle=False, num_workers=1
         )
-
-        # ---------------------------------------------------------------------
-        # CHANGED: Use CoAtNetSegmentationModule instead of Prithvi
         model = CoAtNetSegmentationModule(
             image_size=IM_SIZE,
             learning_rate=cfg.train.learning_rate,
             freeze_backbone=cfg.model.freeze_backbone,
             num_classes=cfg.model.num_classes,
-            temporal_step=cfg.dataloader.temporal_dim,
             class_weights=cfg.train.class_weights,
             ignore_index=cfg.train.ignore_index,
             weight_decay=cfg.train.weight_decay,
-            coatnet_variant=cfg.model.coatnet_variant,
-            in_chans=len(BANDS) * cfg.dataloader.temporal_dim,
         )
-        # ---------------------------------------------------------------------
-
         hydra_out_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
         checkpoint_callback = ModelCheckpoint(
             monitor="val_mIoU",
@@ -444,6 +562,7 @@ def main(cfg: DictConfig) -> None:
             mode="max",
             save_top_k=3,
         )
+
         logger = TensorBoardLogger(hydra_out_dir, name="instageo")
 
         trainer = pl.Trainer(
@@ -452,6 +571,8 @@ def main(cfg: DictConfig) -> None:
             callbacks=[checkpoint_callback],
             logger=logger,
         )
+
+        # run training and validation
         trainer.fit(model, train_loader, valid_loader)
 
     elif cfg.mode == "eval":
@@ -478,39 +599,29 @@ def main(cfg: DictConfig) -> None:
         test_loader = create_dataloader(
             test_dataset, batch_size=batch_size, collate_fn=eval_collate_fn
         )
-        # CHANGED: Load CoAtNetSegmentationModule
-        model = CoAtNetSegmentationModule.load_from_checkpoint(
-            checkpoint_path,
+        model = CoAtNetSegmentationModule(
             image_size=IM_SIZE,
             learning_rate=cfg.train.learning_rate,
             freeze_backbone=cfg.model.freeze_backbone,
             num_classes=cfg.model.num_classes,
-            temporal_step=cfg.dataloader.temporal_dim,
             class_weights=cfg.train.class_weights,
             ignore_index=cfg.train.ignore_index,
             weight_decay=cfg.train.weight_decay,
-            coatnet_variant=cfg.model.coatnet_variant,
-            in_chans=len(BANDS) * cfg.dataloader.temporal_dim,
         )
         trainer = pl.Trainer(accelerator=get_device())
         result = trainer.test(model, dataloaders=test_loader)
         log.info(f"Evaluation results:\n{result}")
 
-    elif cfg.mode in "sliding_inference":
-        model = CoAtNetSegmentationModule.load_from_checkpoint(
-            checkpoint_path,
+    elif cfg.mode == "sliding_inference":
+        model = CoAtNetSegmentationModule(
             image_size=IM_SIZE,
             learning_rate=cfg.train.learning_rate,
             freeze_backbone=cfg.model.freeze_backbone,
             num_classes=cfg.model.num_classes,
-            temporal_step=cfg.dataloader.temporal_dim,
             class_weights=cfg.train.class_weights,
             ignore_index=cfg.train.ignore_index,
             weight_decay=cfg.train.weight_decay,
-            coatnet_variant=cfg.model.coatnet_variant,
-            in_chans=len(BANDS) * cfg.dataloader.temporal_dim,
         )
-        # Then do the inference logic as before...
         model.eval()
         infer_filepath = os.path.join(root_dir, cfg.test_filepath)
         assert (
@@ -571,7 +682,79 @@ def main(cfg: DictConfig) -> None:
                 transform=transform,
             ) as dst:
                 dst.write(prediction, 1)
-    
+
+    elif cfg.mode == "sliding_inference":
+        model = CoAtNetSegmentationModule(
+            image_size=IM_SIZE,
+            learning_rate=cfg.train.learning_rate,
+            freeze_backbone=cfg.model.freeze_backbone,
+            num_classes=cfg.model.num_classes,
+            class_weights=cfg.train.class_weights,
+            ignore_index=cfg.train.ignore_index,
+            weight_decay=cfg.train.weight_decay,
+        )
+        model.eval()
+        infer_filepath = os.path.join(root_dir, cfg.test_filepath)
+        assert (
+            os.path.splitext(infer_filepath)[-1] == ".json"
+        ), f"Test file path expects a json file but got {infer_filepath}"
+        output_dir = os.path.join(root_dir, "predictions")
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(infer_filepath)) as json_file:
+            hls_dataset = json.load(json_file)
+        for key, hls_tile_path in tqdm(
+            hls_dataset.items(), desc="Processing HLS Dataset"
+        ):
+            try:
+                hls_tile, _ = process_data(
+                    hls_tile_path,
+                    None,
+                    bands=cfg.dataloader.bands,
+                    no_data_value=cfg.dataloader.no_data_value,
+                    constant_multiplier=cfg.dataloader.constant_multiplier,
+                    mask_cloud=cfg.test.mask_cloud,
+                    replace_label=cfg.dataloader.replace_label,
+                    reduce_to_zero=cfg.dataloader.reduce_to_zero,
+                )
+            except rasterio.RasterioIOError:
+                continue
+            nan_mask = hls_tile == cfg.dataloader.no_data_value
+            nan_mask = np.any(nan_mask, axis=0).astype(int)
+            hls_tile, _ = process_and_augment(
+                hls_tile,
+                None,
+                mean=cfg.dataloader.mean,
+                std=cfg.dataloader.std,
+                temporal_size=cfg.dataloader.temporal_dim,
+                augment=False,
+            )
+            prediction = sliding_window_inference(
+                hls_tile,
+                model,
+                window_size=(cfg.test.img_size, cfg.test.img_size),
+                stride=cfg.test.stride,
+                batch_size=cfg.train.batch_size,
+                device=get_device(),
+            )
+            prediction = np.where(nan_mask == 1, np.nan, prediction)
+            prediction_filename = os.path.join(output_dir, f"{key}_prediction.tif")
+            with rasterio.open(hls_tile_path["tiles"]["B02_0"]) as src:
+                crs = src.crs
+                transform = src.transform
+            with rasterio.open(
+                prediction_filename,
+                "w",
+                driver="GTiff",
+                height=prediction.shape[0],
+                width=prediction.shape[1],
+                count=1,
+                dtype=str(prediction.dtype),
+                crs=crs,
+                transform=transform,
+            ) as dst:
+                dst.write(prediction, 1)
+
+    # TODO: Add support for chips that are greater than image size used for training
     elif cfg.mode == "chip_inference":
         check_required_flags(["root_dir", "test_filepath", "checkpoint_path"], cfg)
         output_dir = os.path.join(root_dir, "predictions")
@@ -597,18 +780,14 @@ def main(cfg: DictConfig) -> None:
         test_loader = create_dataloader(
             test_dataset, batch_size=batch_size, collate_fn=infer_collate_fn
         )
-        model = CoAtNetSegmentationModule.load_from_checkpoint(
-            checkpoint_path,
+        model = CoAtNetSegmentationModule(
             image_size=IM_SIZE,
             learning_rate=cfg.train.learning_rate,
             freeze_backbone=cfg.model.freeze_backbone,
             num_classes=cfg.model.num_classes,
-            temporal_step=cfg.dataloader.temporal_dim,
             class_weights=cfg.train.class_weights,
             ignore_index=cfg.train.ignore_index,
             weight_decay=cfg.train.weight_decay,
-            coatnet_variant=cfg.model.coatnet_variant,
-            in_chans=len(BANDS) * cfg.dataloader.temporal_dim,
         )
         chip_inference(test_loader, output_dir, model, device=get_device())
 
