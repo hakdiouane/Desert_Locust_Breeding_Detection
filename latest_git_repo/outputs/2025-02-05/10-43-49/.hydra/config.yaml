@@ -1,0 +1,65 @@
+checkpoint_path: null
+dataloader:
+  bands:
+  - 0
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+  - 6
+  - 7
+  - 8
+  - 9
+  - 10
+  - 11
+  - 12
+  - 13
+  - 14
+  - 15
+  - 16
+  - 17
+  constant_multiplier: 1.0
+  img_size: 256
+  mean:
+  - 670.5441284179688
+  - 1267.7974853515625
+  - 1772.599365234375
+  - 2415.69091796875
+  - 2879.2431640625
+  - 2337.822509765625
+  no_data_value: -9999
+  reduce_to_zero: false
+  replace_label:
+  - -9999
+  - -1
+  std:
+  - 2146.305419921875
+  - 2203.416259765625
+  - 2247.03515625
+  - 2310.74755859375
+  - 2322.708984375
+  - 2211.968505859375
+  temporal_dim: 3
+mode: stats
+model:
+  freeze_backbone: false
+  num_classes: 2
+root_dir: /geo-ai-hack
+test:
+  crop_size: 256
+  img_size: 256
+  mask_cloud: false
+  stride: 256
+test_filepath: null
+train:
+  batch_size: 8
+  class_weights:
+  - 1
+  - 1
+  ignore_index: -1
+  learning_rate: 0.0001
+  num_epochs: 1
+  weight_decay: 0.1
+train_filepath: train_ds.csv
+valid_filepath: null

@@ -1,0 +1,5 @@
+- root_dir=geo-ai-hack
+- train.batch_size=8
+- train.num_epochs=1
+- mode=stats
+- train_filepath=train_ds.csv
