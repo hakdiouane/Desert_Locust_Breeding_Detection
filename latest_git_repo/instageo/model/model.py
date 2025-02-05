@@ -177,5 +177,7 @@ class CoAtNetSeg(nn.Module):
 
         # Pass through backbone and segmentation head
         features = self.backbone(img)
-        features = features.unsqueeze(0)
+        if features.ndim == 4:
+            features = features.unsqueeze(0)
+            
         return self.segmentation_head(features)
