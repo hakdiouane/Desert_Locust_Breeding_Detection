@@ -251,7 +251,8 @@ def get_raster_data(
     bands = []
     for band in data:
         if band.max() > 10:
-            band *= 0.0001
+            #band *= 0.0001
+            band = band.astype(np.float32) * 0.0001
         bands.append(band)
     data = np.stack(bands, axis=0)
     return data
