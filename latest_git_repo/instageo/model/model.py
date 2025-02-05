@@ -168,6 +168,10 @@ class CoAtNetSeg(nn.Module):
             img = img.mean(dim=1)  # Average over temporal dimension
         elif img.ndim == 4:  # Input shape: [batch_size, channels, height, width]
             pass  # No temporal dimension, proceed as is
+        elif img.ndim == 3:  # Input shape: [batch_size, channels, height, width]
+            pass 
+        elif img.ndim == 3:  # Input shape: [batch_size, channels, height, width]
+            img = img.unsqueeze() 
         else:
             raise ValueError(f"Unexpected input shape: {img.shape}")
 
